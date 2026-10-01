@@ -1,3 +1,5 @@
+from datetime import time as dt_time
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -12,6 +14,12 @@ from telegram.ext import (
 from app.bot.formatting import NOMBRE_MEDIO_PAGO, color_emoji, fmt_money
 from app.config import TZ
 from app.models import MedioPago, Semana, Tarjeta, TipoMovimiento
+from app.services.cargos import (
+    cargos_proximos,
+    cargos_que_vencen_en,
+    marcar_pagado_si_corresponde,
+    proximo_cargo_pendiente,
+)
 from app.services.movimientos import (
     deshacer_por_id,
     parse_captura_rapida,
@@ -19,16 +27,21 @@ from app.services.movimientos import (
     registrar_ajuste,
     registrar_gasto,
     registrar_ingreso,
+    registrar_pago_tarjeta,
     toggle_categoria,
 )
 from app.services.saldos import ahorro_acumulado, saldo_banco
 from app.services.semanas import (
     cerrar_semana,
     gastado_caja,
+    hoy,
     obtener_o_crear_semana_actual,
     obtener_semana_actual,
     resumen_semana,
 )
+from app.services.tarjetas import saldo_tarjeta
+
+NOMBRES_TARJETA_VALIDOS = ("nu", "mp")
 
 SETUP_BANCO, SETUP_NU, SETUP_MP, SETUP_PRESUPUESTO = range(4)
 
@@ -240,6 +253,96 @@ async def cmd_cierre(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(texto, reply_markup=keyboard)
 
 
+async def cmd_deudas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    Session = _session_factory(context)
+    with Session() as session:
+        tarjetas = session.query(Tarjeta).order_by(Tarjeta.dia_pago).all()
+        if not tarjetas:
+            texto = "Aún no tienes tarjetas configuradas. Usa /setup primero."
+        else:
+            lineas = []
+            for tarjeta in tarjetas:
+                saldo = saldo_tarjeta(session, tarjeta.id)
+                proximo = proximo_cargo_pendiente(session, tarjeta.id)
+                if proximo is not None:
+                    extra = f" ({proximo.numero_pago})" if proximo.numero_pago else ""
+                    linea_pago = (
+                        f"Próximo pago: {proximo.fecha:%d-%b} "
+                        f"{fmt_money(proximo.monto_centavos)}{extra}"
+                    )
+                else:
+                    linea_pago = f"Pago cada día {tarjeta.dia_pago} del mes"
+                lineas.append(
+                    f"💳 {tarjeta.nombre.upper()} — Debes: {fmt_money(saldo)} · {linea_pago}"
+                )
+            texto = "\n".join(lineas)
+
+    await update.message.reply_text(texto)
+
+
+async def cmd_pagar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if len(context.args) < 2:
+        await update.message.reply_text("Uso: /pagar <nu|mp> <monto>\nEj: /pagar nu 800")
+        return
+
+    nombre = context.args[0].lower()
+    if nombre not in NOMBRES_TARJETA_VALIDOS:
+        await update.message.reply_text("La tarjeta debe ser 'nu' o 'mp'.")
+        return
+
+    monto = parse_monto_centavos(context.args[1])
+    if monto is None:
+        await update.message.reply_text("El monto no es válido.")
+        return
+
+    Session = _session_factory(context)
+    with Session() as session:
+        tarjeta = session.query(Tarjeta).filter(Tarjeta.nombre == nombre).one_or_none()
+        if tarjeta is None:
+            await update.message.reply_text(
+                f"No tienes la tarjeta '{nombre}' configurada. Usa /setup."
+            )
+            return
+
+        registrar_pago_tarjeta(session, tarjeta.id, monto, fecha=_fecha_del_mensaje(update))
+        cargo = marcar_pagado_si_corresponde(session, tarjeta.id)
+        nuevo_saldo = saldo_tarjeta(session, tarjeta.id)
+        banco = saldo_banco(session)
+
+        texto = (
+            f"✅ Pago {nombre.upper()} {fmt_money(monto)}\n"
+            f"💳 Deuda restante: {fmt_money(nuevo_saldo)}\n"
+            f"🏦 Banco: {fmt_money(banco)}"
+        )
+        if cargo is not None:
+            etiqueta = cargo.numero_pago or cargo.fecha.strftime("%d-%b")
+            texto += f"\n☑️ Marcado como pagado: {etiqueta}"
+
+    await update.message.reply_text(texto)
+
+
+async def cmd_proximos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    Session = _session_factory(context)
+    with Session() as session:
+        cargos = cargos_proximos(session, dias=14)
+        if not cargos:
+            texto = "No tienes pagos programados en los próximos 14 días."
+        else:
+            hoy_ = hoy()
+            lineas = ["📌 Próximos pagos:"]
+            for cargo in cargos:
+                dias_faltan = (cargo.fecha - hoy_).days
+                nombre_tarjeta = f" · {cargo.tarjeta.nombre.upper()}" if cargo.tarjeta else ""
+                extra = f" ({cargo.numero_pago})" if cargo.numero_pago else ""
+                lineas.append(
+                    f"{cargo.fecha:%d-%b} ({dias_faltan}d){nombre_tarjeta} — "
+                    f"{cargo.concepto} {fmt_money(cargo.monto_centavos)}{extra}"
+                )
+            texto = "\n".join(lineas)
+
+    await update.message.reply_text(texto)
+
+
 # --- Botones inline ----------------------------------------------------
 
 
@@ -388,6 +491,34 @@ async def cmd_cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return ConversationHandler.END
 
 
+# --- Recordatorios automáticos ------------------------------------------
+
+
+async def job_recordatorios_diarios(context: ContextTypes.DEFAULT_TYPE) -> None:
+    Session = context.application.bot_data["Session"]
+    allowed_user_id = context.application.bot_data["allowed_user_id"]
+    mensajes: list[str] = []
+
+    with Session() as session:
+        for cargo in cargos_que_vencen_en(session, dias=0):
+            nombre_tarjeta = f" ({cargo.tarjeta.nombre.upper()})" if cargo.tarjeta else ""
+            mensajes.append(
+                f"📌 Hoy toca pagar: {cargo.concepto} {fmt_money(cargo.monto_centavos)}{nombre_tarjeta}"
+            )
+        for cargo in cargos_que_vencen_en(session, dias=1):
+            nombre_tarjeta = f" ({cargo.tarjeta.nombre.upper()})" if cargo.tarjeta else ""
+            mensajes.append(
+                f"⏰ Mañana se paga: {cargo.concepto} {fmt_money(cargo.monto_centavos)}{nombre_tarjeta}"
+            )
+        if hoy().weekday() == 4:  # viernes
+            semana = obtener_semana_actual(session)
+            if semana is not None:
+                mensajes.append("📅 Hoy es viernes: no olvides cerrar tu semana con /cierre")
+
+    for texto in mensajes:
+        await context.bot.send_message(chat_id=allowed_user_id, text=texto)
+
+
 def register_handlers(application: Application, allowed_user_id: int) -> None:
     application.bot_data["allowed_user_id"] = allowed_user_id
     solo_dueno = filters.User(user_id=allowed_user_id)
@@ -412,7 +543,17 @@ def register_handlers(application: Application, allowed_user_id: int) -> None:
     application.add_handler(CommandHandler("ingreso", cmd_ingreso, filters=solo_dueno))
     application.add_handler(CommandHandler("presupuesto", cmd_presupuesto, filters=solo_dueno))
     application.add_handler(CommandHandler("cierre", cmd_cierre, filters=solo_dueno))
+    application.add_handler(CommandHandler("deudas", cmd_deudas, filters=solo_dueno))
+    application.add_handler(CommandHandler("pagar", cmd_pagar, filters=solo_dueno))
+    application.add_handler(CommandHandler("proximos", cmd_proximos, filters=solo_dueno))
     application.add_handler(CallbackQueryHandler(cb_botones))
     application.add_handler(
         MessageHandler(solo_dueno & filters.TEXT & ~filters.COMMAND, on_text_message)
     )
+
+    if application.job_queue is not None:
+        application.job_queue.run_daily(
+            job_recordatorios_diarios,
+            time=dt_time(hour=9, minute=0, tzinfo=TZ),
+            name="recordatorios_diarios",
+        )

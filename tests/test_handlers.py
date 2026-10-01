@@ -1,8 +1,9 @@
 import asyncio
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import app.services.cargos as cargos_mod
 from app.bot import handlers as h
 
 
@@ -19,6 +20,7 @@ def make_context(session_factory, args=None, user_data=None, allowed_user_id=1):
         application=application,
         args=args or [],
         user_data=user_data if user_data is not None else {},
+        bot=SimpleNamespace(send_message=AsyncMock()),
     )
 
 
@@ -196,3 +198,155 @@ def test_usuario_no_autorizado_es_ignorado_en_botones(session_factory):
     run(h.cb_botones(cb_upd, make_context(session_factory)))
     cb_upd.callback_query.edit_message_text.assert_not_awaited()
     cb_upd.callback_query.answer.assert_awaited_once()
+
+
+def _setup_tarjetas(session_factory, saldo_nu=170_700, saldo_mp=0):
+    from app.models import Tarjeta
+
+    with session_factory() as session:
+        session.add_all(
+            [
+                Tarjeta(nombre="nu", dia_pago=25, saldo_inicial_centavos=saldo_nu),
+                Tarjeta(nombre="mp", dia_pago=7, saldo_inicial_centavos=saldo_mp),
+            ]
+        )
+        session.commit()
+
+
+def test_deudas_sin_tarjetas_pide_setup(session_factory):
+    update = make_message_update("/deudas")
+    run(h.cmd_deudas(update, make_context(session_factory)))
+    assert "Usa /setup" in update.message.reply_text.call_args[0][0]
+
+
+def test_deudas_muestra_saldo_y_proximo_pago(session_factory):
+    _setup_tarjetas(session_factory)
+    from app.models import CargoProgramado, EstadoCargo, Tarjeta
+
+    with session_factory() as session:
+        nu = session.query(Tarjeta).filter(Tarjeta.nombre == "nu").one()
+        session.add(
+            CargoProgramado(
+                tarjeta_id=nu.id,
+                concepto="Pago Nu",
+                monto_centavos=80_000,
+                fecha=date(2026, 10, 25),
+                numero_pago=None,
+                estado=EstadoCargo.PENDIENTE,
+            )
+        )
+        session.commit()
+
+    update = make_message_update("/deudas")
+    run(h.cmd_deudas(update, make_context(session_factory)))
+    texto = update.message.reply_text.call_args[0][0]
+    assert "💳 NU — Debes: $1,707" in texto
+    assert "Próximo pago: 25-Oct $800" in texto
+    assert "💳 MP — Debes: $0" in texto
+
+
+def test_pagar_reduce_deuda_y_marca_cargo(session_factory):
+    _setup_tarjetas(session_factory)
+    from app.models import CargoProgramado, EstadoCargo, Tarjeta
+
+    with session_factory() as session:
+        nu = session.query(Tarjeta).filter(Tarjeta.nombre == "nu").one()
+        session.add(
+            CargoProgramado(
+                tarjeta_id=nu.id,
+                concepto="Pago Nu",
+                monto_centavos=170_700,
+                fecha=date(2026, 9, 28),
+                numero_pago=None,
+                estado=EstadoCargo.PENDIENTE,
+            )
+        )
+        session.commit()
+
+    ctx = make_context(session_factory, args=["nu", "1707"])
+    update = make_message_update("/pagar nu 1707")
+    run(h.cmd_pagar(update, ctx))
+    texto = update.message.reply_text.call_args[0][0]
+    assert "✅ Pago NU $1,707" in texto
+    assert "💳 Deuda restante: $0" in texto
+    assert "☑️ Marcado como pagado" in texto
+
+
+def test_pagar_tarjeta_invalida(session_factory):
+    ctx = make_context(session_factory, args=["visa", "100"])
+    update = make_message_update("/pagar visa 100")
+    run(h.cmd_pagar(update, ctx))
+    assert "debe ser 'nu' o 'mp'" in update.message.reply_text.call_args[0][0]
+
+
+def test_proximos_vacio(session_factory):
+    update = make_message_update("/proximos")
+    run(h.cmd_proximos(update, make_context(session_factory)))
+    assert "No tienes pagos programados" in update.message.reply_text.call_args[0][0]
+
+
+def test_proximos_lista_cargos_en_ventana(session_factory, monkeypatch):
+    monkeypatch.setattr(h, "hoy", lambda: date(2026, 10, 1))
+    monkeypatch.setattr(cargos_mod, "hoy", lambda: date(2026, 10, 1))
+    _setup_tarjetas(session_factory)
+    from app.models import CargoProgramado, EstadoCargo, Tarjeta
+
+    with session_factory() as session:
+        mp = session.query(Tarjeta).filter(Tarjeta.nombre == "mp").one()
+        session.add(
+            CargoProgramado(
+                tarjeta_id=mp.id,
+                concepto="Pago Mercado Pago",
+                monto_centavos=101_400,
+                fecha=date(2026, 10, 7),
+                numero_pago=None,
+                estado=EstadoCargo.PENDIENTE,
+            )
+        )
+        session.commit()
+
+    update = make_message_update("/proximos")
+    run(h.cmd_proximos(update, make_context(session_factory)))
+    texto = update.message.reply_text.call_args[0][0]
+    assert "07-Oct (6d) · MP" in texto
+    assert "$1,014" in texto
+
+
+def test_job_recordatorios_avisa_pagos_de_hoy_y_manana(session_factory, monkeypatch):
+    monkeypatch.setattr(h, "hoy", lambda: date(2026, 10, 6))
+    monkeypatch.setattr(cargos_mod, "hoy", lambda: date(2026, 10, 6))
+    _setup_tarjetas(session_factory)
+    from app.models import CargoProgramado, EstadoCargo, Tarjeta
+
+    with session_factory() as session:
+        mp = session.query(Tarjeta).filter(Tarjeta.nombre == "mp").one()
+        session.add(
+            CargoProgramado(
+                tarjeta_id=mp.id,
+                concepto="Pago Mercado Pago",
+                monto_centavos=101_400,
+                fecha=date(2026, 10, 7),
+                numero_pago=None,
+                estado=EstadoCargo.PENDIENTE,
+            )
+        )
+        session.commit()
+
+    ctx = make_context(session_factory)
+    run(h.job_recordatorios_diarios(ctx))
+    ctx.bot.send_message.assert_awaited_once()
+    texto = ctx.bot.send_message.call_args.kwargs["text"]
+    assert "Mañana se paga" in texto
+    assert "$1,014" in texto
+
+
+def test_job_recordatorios_avisa_cierre_los_viernes(session_factory, monkeypatch):
+    monkeypatch.setattr(h, "hoy", lambda: date(2026, 10, 2))  # viernes
+    ctx = make_context(session_factory)
+    update = make_message_update("66 pollo", fecha=datetime(2026, 10, 2, tzinfo=timezone.utc))
+    run(h.on_text_message(update, ctx))  # crea la semana actual (abierta)
+
+    ctx_job = make_context(session_factory)
+    run(h.job_recordatorios_diarios(ctx_job))
+    ctx_job.bot.send_message.assert_awaited_once()
+    assert "viernes" in ctx_job.bot.send_message.call_args.kwargs["text"]
